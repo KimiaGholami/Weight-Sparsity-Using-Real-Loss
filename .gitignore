@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Paper PDFs -- not authored by this repo, CWS.pdf explicitly says "do not distribute"
+CWS.pdf
+SparseGPT.pdf
+ELSA.pdf
+
+*.csv
+*.log
