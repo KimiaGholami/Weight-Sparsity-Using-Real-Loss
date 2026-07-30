@@ -175,57 +175,6 @@ sample-size experiment above was run against the
 since-fixed, conceptually wrong construction, so it doesn't say anything
 about the corrected version's data efficiency.
 
-### CWS paper's own published results (reference, not reproduced here)
-
-These are the CWS paper's own numbers (`CWS.pdf`, Tables 3/6/10), for
-context on how `cws`'s selection criterion is reported to behave across
-sparsity levels and model scales — WikiText-2 perplexity, one-shot pruning,
-their own baselines (Wanda, RIA, SparseGPT, AWP). Not run by us; included
-purely as the paper's reference point, on different (larger) models than
-the OPT-125M runs above.
-
-**TinyLlama-1.1B** (dense PPL 7.8):
-
-| Sparsity | CWS | Wanda | RIA | SparseGPT | AWP |
-|---|---|---|---|---|---|
-| 30% | **8.13** | 8.15 | 8.14 | 8.37 | 8.16 |
-| 40% | **8.74** | 8.82 | 8.81 | 9.41 | 8.82 |
-| 50% | **10.20** | 10.73 | 10.77 | 11.83 | 10.73 |
-| 60% | **14.60** | 19.76 | 19.69 | 17.83 | 19.86 |
-| 70% | **34.40** | 94.92 | 96.21 | 62.38 | 95.80 |
-| 80% | **217.27** | 615 | 902 | 1,490 | 637 |
-
-**HGRN-1.3B** (dense PPL 11.8; gated recurrent SSM, no attention):
-
-| Sparsity | CWS | Wanda | RIA | SparseGPT | AWP |
-|---|---|---|---|---|---|
-| 30% | **12.14** | 31.64 | 25.6 | 15.02 | 21.7 |
-| 40% | **12.69** | 76.87 | 54.3 | 16.46 | 49.7 |
-| 50% | **13.88** | 350 | 348 | 17.4 | 426.2 |
-| 60% | **17.07** | 11,552 | 8,239 | 32.43 | 2,616 |
-| 70% | **31.11** | 20,592 | 17,457 | 115.4 | 4,440 |
-| 80% | **131.27** | 76,051 | 28,615 | 6,956 | 17,195 |
-
-**LLaMA-7B** (dense PPL 6.61):
-
-| Sparsity | CWS | Wanda | RIA | SparseGPT | AWP |
-|---|---|---|---|---|---|
-| 30% | 6.87 | 6.89 | 6.84 | 6.99 | **6.81** |
-| 40% | 7.30 | 7.40 | 7.30 | 7.76 | **7.19** |
-| 50% | 8.24 | 8.69 | 8.58 | 9.51 | **8.10** |
-| 60% | **10.96** | 14.40 | 14.22 | 15.64 | 11.33 |
-| 70% | **26.85** | 77.82 | 102.17 | 67.02 | 31.99 |
-| 80% | **245.5** | 1,647.4 | 2,084.1 | 2,071.2 | 211.1 |
-
-The paper's own headline finding here: CWS's advantage is largest on
-sub-2B models (TinyLlama, HGRN), where it wins at every sparsity level
-tested. At 7B scale the ordering partially inverts — AWP (an iterative
-gradient-based mask search) overtakes CWS on raw perplexity at low-to-mid
-sparsity, though the paper reports CWS still keeps the best zero-shot task
-accuracy at 80% sparsity despite AWP's lower perplexity there, and AWP costs
-substantially more compute (up to 200 gradient steps per layer vs. CWS's
-single closed-form pass).
-
 ## Usage
 
 ```bash
