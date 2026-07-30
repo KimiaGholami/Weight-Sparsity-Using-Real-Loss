@@ -25,6 +25,15 @@ def parse_args():
         "Fisher approximation of the REAL loss's Hessian instead of the reconstruction surrogate "
         "(fisher_hessian.py)",
     )
+    p.add_argument(
+        "--fisher-mode",
+        type=str,
+        default="row",
+        choices=["row", "shared"],
+        help="Only used by --method cws_realloss. 'row' = separate Hessian per output row "
+        "(accurate, slow: separate Cholesky per row). 'shared' = one Hessian averaged across "
+        "all output rows (same cost profile as cws/sparsegpt, less exact).",
+    )
     p.add_argument("--sparsity", type=float, default=0.5)
     p.add_argument(
         "--blocksize",
@@ -71,9 +80,14 @@ def main():
         damping=args.damping,
         adaptive=not args.no_adaptive,
         method=args.method,
+        fisher_mode=args.fisher_mode,
     )
 
-    print(f"Pruning to {args.sparsity:.0%} sparsity, method={args.method}, blocksize={args.blocksize} ...")
+    fisher_note = f", fisher_mode={args.fisher_mode}" if args.method == "cws_realloss" else ""
+    print(
+        f"Pruning to {args.sparsity:.0%} sparsity, method={args.method}{fisher_note}, "
+        f"blocksize={args.blocksize} ..."
+    )
     log = pruner.prune(calib_batches, realloss_batches)
 
     with open(args.out, "w", newline="") as f:

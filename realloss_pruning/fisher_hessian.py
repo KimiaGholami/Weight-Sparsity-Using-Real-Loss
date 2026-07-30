@@ -12,6 +12,15 @@ def _working_dtype(device) -> torch.dtype:
     return torch.float32 if device.type == "mps" else torch.float64
 
 
+def _damp(H: torch.Tensor, damping: float) -> torch.Tensor:
+    diag_idx = torch.arange(H.shape[0], device=H.device)
+    dead = H[diag_idx, diag_idx] == 0
+    H[dead, dead] = 1.0
+    damp = damping * H[diag_idx, diag_idx].mean()
+    H[diag_idx, diag_idx] += damp
+    return H
+
+
 class FisherActivationGradCache:
     """Caches forward input activations and backward output gradients for a
     linear layer across all calibration batches, then builds a genuinely
@@ -72,13 +81,27 @@ class FisherActivationGradCache:
         weighted_x = self.X * self.G[:, row : row + 1]
         n = weighted_x.shape[0]
         H = (weighted_x.t() @ weighted_x) / max(n, 1)
+        return _damp(H, damping)
 
-        diag_idx = torch.arange(H.shape[0], device=H.device)
-        dead = H[diag_idx, diag_idx] == 0
-        H[dead, dead] = 1.0
-        damp = damping * H[diag_idx, diag_idx].mean()
-        H[diag_idx, diag_idx] += damp
-        return H
+    def get_dampened_shared_hessian(self, damping: float = 0.01) -> torch.Tensor:
+        """One Hessian shared across all output rows, built from the same
+        cached (X, G) this cache already holds -- no extra forward/backward
+        pass needed. Reintroduces the earlier, cheaper `cws_realloss`
+        construction (row-averaged real-loss sensitivity) as an explicit,
+        selectable alternative to `get_dampened_row_hessian`'s per-row
+        version: one shared Cholesky factorization per layer, same cost
+        profile as `cws`/`sparsegpt`, instead of a separate factorization
+        per output row. `s_n = RMS(dL/dy_n)` stands in for the row-specific
+        `d^2L/dy_i^2`, averaged across output rows -- the same free
+        simplification `cws`/`sparsegpt` make for the reconstruction
+        Hessian, except here it's a real approximation (see this class's
+        docstring), not something the objective already gives you for free.
+        """
+        s = self.G.pow(2).mean(dim=-1).sqrt()
+        weighted_x = self.X * s.unsqueeze(1)
+        n = weighted_x.shape[0]
+        H = (weighted_x.t() @ weighted_x) / max(n, 1)
+        return _damp(H, damping)
 
     def make_forward_hook(self):
         def hook(module, inputs):
@@ -92,6 +115,20 @@ class FisherActivationGradCache:
                 self.capture_output_grad(grad_output[0])
 
         return hook
+
+
+def _robust_hinv(build_H, damping: float, max_retries: int, backoff: float, label: str):
+    current_damping = damping
+    for _ in range(max_retries):
+        H = build_H(current_damping)
+        try:
+            return compute_hinv_cholesky(H), current_damping
+        except torch.linalg.LinAlgError:
+            current_damping *= backoff
+    raise RuntimeError(
+        f"Cholesky failed for {label} even after {max_retries} damping retries "
+        f"(final damping tried: {current_damping})"
+    )
 
 
 def robust_row_hinv(
@@ -117,16 +154,27 @@ def robust_row_hinv(
 
     Returns (Hinv, damping_used).
     """
-    current_damping = damping
-    for _ in range(max_retries):
-        H = cache.get_dampened_row_hessian(row, current_damping)
-        try:
-            return compute_hinv_cholesky(H), current_damping
-        except torch.linalg.LinAlgError:
-            current_damping *= backoff
-    raise RuntimeError(
-        f"Cholesky failed for row {row} even after {max_retries} damping retries "
-        f"(final damping tried: {current_damping})"
+    return _robust_hinv(
+        lambda d: cache.get_dampened_row_hessian(row, d), damping, max_retries, backoff, f"row {row}"
+    )
+
+
+def robust_shared_hinv(
+    cache: FisherActivationGradCache,
+    damping: float,
+    max_retries: int = 8,
+    backoff: float = 10.0,
+):
+    """Same damping-retry safety net as `robust_row_hinv`, for the single
+    shared (all-rows-averaged) Hessian instead of a per-row one. Less
+    likely to need it in practice -- averaging across rows smooths out the
+    near-singular cases a single degenerate row can produce -- but cheap
+    to guard against regardless.
+
+    Returns (Hinv, damping_used).
+    """
+    return _robust_hinv(
+        lambda d: cache.get_dampened_shared_hessian(d), damping, max_retries, backoff, "shared Hessian"
     )
 
 
