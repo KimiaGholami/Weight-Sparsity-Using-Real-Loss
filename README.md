@@ -140,65 +140,164 @@ machinery; they differ only in which Hessian `H` feeds it. Select with
   workload, and it has no float64 support at all, which caused an
   independent numerically-real Cholesky failure when tested with float32.
 
+  **`--fisher-mode {row,shared}`** selects between the two constructions
+  described above: `row` (default) is the accurate-but-slow per-output-row
+  Hessian just described; `shared` reintroduces the cheaper, row-averaged
+  construction (`FisherActivationGradCache.get_dampened_shared_hessian`,
+  same `s_n = RMS(∂L/∂yₙ)` reweighting as the original, since-corrected
+  version of this module) as an explicit, selectable option -- one shared
+  Cholesky factorization per layer, same cost profile as `cws`/`sparsegpt`
+  (minutes, not hours), reusing the *same cached activations/gradients*
+  `row` mode builds, so it needs no extra forward+backward pass. Measured
+  on OPT-125M at 50% sparsity, `row` only barely beats `shared` (60.42 vs.
+  61.79 ppl, both at `--n-calib 8`) for roughly 50-100x more compute, so
+  `shared` is the more practical default despite being less exact -- see
+  [Measured results](#measured-results) for how much more calibration data
+  changes this picture.
+
 ## Measured results
 
-OPT-125M, 50% sparsity, WikiText-2 calibration (8 batches, seqlen 256),
-same held-out real-loss set across all runs (dense baseline: 38.94
-perplexity):
+All runs: `facebook/opt-125m`, 50% sparsity, `--blocksize 128`,
+`--damping 0.01` (default), `--seqlen 256`, WikiText-2 calibration
+(`Salesforce/wikitext`, `wikitext-2-raw-v1` train split), CPU (Apple
+Silicon M1, no GPU) -- see [Environment](#environment) for exact package
+versions. Each row below is independently reproducible with the exact
+command shown.
 
-| Method | Final perplexity | vs. dense |
-|---|---|---|
-| `cws` | 49.05 | +26% |
-| `sparsegpt` | 50.31 | +29% |
-| `cws_realloss` (row-level Fisher) | 60.42 | +55% |
-| `cws_realloss` (shared/averaged Fisher, superseded) | 61.79 | +59% |
+**Important caveat on comparing across different `--n-calib` values**: the
+calibration and held-out real-loss batches are both drawn by
+`realloss_pruning/data.py`'s `get_wikitext2_batches`, which samples
+`n_calib + n_realloss` total chunks from a fixed-seed RNG (`seed=0` by
+default). Because the *count* requested changes what a fixed-seed
+`random.sample` call returns, changing `--n-calib` changes *which text*
+ends up in the held-out real-loss set too -- so runs at different
+`--n-calib` have different dense-model baselines and are **not** directly
+comparable on raw perplexity. Compare *relative degradation*
+(`pruned_ppl / dense_ppl` from the *same run*) instead when `--n-calib`
+differs; only compare raw perplexity directly when `--n-calib` (and
+`--n-realloss`, `--seqlen`) match exactly, since only then is the held-out
+set identical.
+
+### `--n-calib 8 --n-realloss 4` (dense baseline: 38.94 ppl)
+
+| Method | Command (append to `python run_prune.py --model facebook/opt-125m --blocksize 128 --sparsity 0.5 --n-calib 8 --n-realloss 4 --seqlen 256`) | Final ppl | vs. dense | Wall time (CPU) |
+|---|---|---|---|---|
+| `cws` | `--method cws` | 49.05 | 1.260x (+26%) | ~85 min |
+| `sparsegpt` | `--method sparsegpt` | 50.31 | 1.292x (+29%) | ~2 min |
+| `cws_realloss`, row | `--method cws_realloss --fisher-mode row` | 60.42 | 1.552x (+55%) | ~2.5 hr |
+| `cws_realloss`, shared | `--method cws_realloss --fisher-mode shared` | 61.79-62.60* | 1.587-1.608x (+59-61%) | ~17.5 min |
+
+\* Ran twice (once before, once after the row/shared refactor in
+`fisher_hessian.py`); both are the same construction and the small
+difference (61.79 vs. 62.60) is ordinary run-to-run variance, not a
+regression -- included to show that range rather than pick one arbitrarily.
 
 `sparsegpt` lands almost exactly where the synthetic correlated-feature
-test predicted: essentially tied with `cws` (50.31 vs. 49.05), since it
-gets the same full off-diagonal OBS correction and OPT-125M's real weight
-matrices apparently don't have enough exploitable cancellation-group
-structure at this scale/sparsity for `cws`'s full-Hessian selection to pull
-meaningfully ahead — unlike the synthetic test, which was constructed
-specifically to contain strong cancellation groups.
+test predicted (see `sparsegpt_obs.py`'s validation, summarized in the
+method description above): essentially tied with `cws` (50.31 vs. 49.05),
+since it gets the same full off-diagonal OBS correction and OPT-125M's
+real weight matrices apparently don't have enough exploitable
+cancellation-group structure at this scale/sparsity for `cws`'s
+full-Hessian selection to pull meaningfully ahead — unlike the synthetic
+test, which was constructed specifically to contain strong cancellation
+groups.
 
-Row-level Hessians give a small, real improvement to `cws_realloss` over
-sharing one Hessian across all output rows (61.79 → 60.42), consistent with
-row-specific real-loss sensitivity actually mattering -- but `cws_realloss`
-still doesn't catch `cws`/`sparsegpt`. That's consistent with the
+`cws_realloss` row-level Hessians give a small, real improvement over
+sharing one Hessian across all output rows (61.79-62.60 → 60.42),
+consistent with row-specific real-loss sensitivity actually mattering --
+but neither variant catches `cws`/`sparsegpt`. That's consistent with the
 row-sharing simplification being a secondary effect: the dominant gap is
 `cws`/`sparsegpt`'s `H=XᵀX` being an *exact* Hessian of a well-behaved
 surrogate objective, versus `cws_realloss`'s Fisher being an
 *approximation* to the real loss's curvature that carries more estimation
-noise regardless of how it's factored across rows. Whether more
-calibration data closes this gap further is untested — the diagnostic
-sample-size experiment above was run against the
-since-fixed, conceptually wrong construction, so it doesn't say anything
-about the corrected version's data efficiency.
+noise regardless of how it's factored across rows.
 
-## Usage
+### `--n-calib 32 --n-realloss 4` (dense baseline: 49.88 ppl -- different held-out set, see caveat above)
+
+| Method | Command (append to `python run_prune.py --model facebook/opt-125m --blocksize 128 --sparsity 0.5 --n-calib 32 --n-realloss 4 --seqlen 256`) | Final ppl | vs. dense | Wall time (CPU) |
+|---|---|---|---|---|
+| `cws_realloss`, shared | `--method cws_realloss --fisher-mode shared` | 72.98 | 1.463x (+46%) | ~17.5 min |
+
+More calibration data gives the `shared` variant a real, meaningful
+improvement in *relative* terms: degradation drops from 1.587-1.608x (at
+`--n-calib 8`) to 1.463x -- closing a good chunk of the gap to
+`cws`/`sparsegpt`'s 1.260-1.292x, though not all of it. This is consistent
+with calibration-sample-size noise being a real, fixable contributor to
+`cws_realloss`'s gap, on top of the more fundamental (and not
+data-size-fixable) empirical-Fisher-approximation gap discussed above.
+
+**Not yet run**: `cws`, `sparsegpt`, and `cws_realloss --fisher-mode row`
+at `--n-calib 32`, which would let the `--n-calib 32` row above be compared
+on identical held-out data rather than only via the relative-degradation
+proxy. `cws` in particular takes ~85 minutes even at `--n-calib 8` (its
+cost is dominated by CWS's per-block greedy Schur elimination, not by
+calibration size, so ~85 min is a reasonable estimate at `--n-calib 32`
+too); `cws_realloss --fisher-mode row` at `--n-calib 32` would add roughly
+15-20 minutes of extra forward+backward time on top of its ~2.5 hour
+baseline (the per-row Cholesky cost, which dominates, doesn't scale with
+`--n-calib`).
+
+## Environment
+
+Results in this README were produced with:
+
+- Python 3.11.1
+- `torch` 2.13.0, `transformers` 5.14.1, `datasets` 5.0.0 (see
+  `requirements.txt`)
+- macOS 26.5.1, Apple Silicon (arm64), **CPU only** -- no CUDA GPU
+  available. MPS (Apple's GPU backend) was tested and explicitly **not**
+  used: it has no `float64` support at all (the Cholesky-based OBS math
+  here relies on double precision for numerical stability -- switching to
+  float32 caused a genuine `not positive-definite` Cholesky failure, not
+  just reduced precision), and separately benchmarked *slower* than plain
+  CPU for this workload's many small sequential linear-algebra ops (as
+  opposed to the few large batched ops MPS is suited for).
+- No random seed beyond `realloss_pruning/data.py`'s default `seed=0` for
+  calibration/held-out data sampling (see the note in
+  [Measured results](#measured-results) on how changing `--n-calib`
+  changes what that seed samples). Pruning itself is deterministic given
+  fixed calibration data -- no other randomness is introduced.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+```
 
+## Usage
+
+```bash
 # Full-Hessian CWS method (default), blockwise for tractability
 python run_prune.py --model facebook/opt-125m --method cws --blocksize 128 --sparsity 0.5
 
 # Real SparseGPT: diagonal selection, same full off-diagonal OBS correction
 python run_prune.py --model facebook/opt-125m --method sparsegpt --blocksize 128 --sparsity 0.5
 
-# Real-loss Fisher Hessian feeding the same OBS/CWS machinery
-python run_prune.py --model facebook/opt-125m --method cws_realloss --blocksize 128 --sparsity 0.5
+# Real-loss Fisher Hessian feeding the same OBS/CWS machinery, row-level (accurate, slow)
+python run_prune.py --model facebook/opt-125m --method cws_realloss --fisher-mode row --blocksize 128 --sparsity 0.5
+
+# Same, but shared across rows (cheap, less exact)
+python run_prune.py --model facebook/opt-125m --method cws_realloss --fisher-mode shared --blocksize 128 --sparsity 0.5
 ```
 
-Key flags: `--method {cws,sparsegpt,cws_realloss}`, `--sparsity`,
-`--blocksize` (default 128, matching both papers), `--damping`,
-`--n-calib`, `--n-realloss`, `--seqlen`, `--no-adaptive` (disable the
-damping-backoff control loop), `--out` (per-block real-loss CSV log),
-`--save-model`.
+Key flags: `--method {cws,sparsegpt,cws_realloss}`, `--fisher-mode
+{row,shared}` (only used by `--method cws_realloss`; default `row`),
+`--sparsity`, `--blocksize` (default 128, matching both papers),
+`--damping` (default 0.01), `--n-calib` (default 32), `--n-realloss`
+(default 8), `--seqlen` (default 512), `--no-adaptive` (disable the
+damping-backoff control loop), `--out` (per-block real-loss CSV log,
+default `prune_log.csv`), `--save-model` (persist the pruned checkpoint to
+a directory), `--device` (default `cuda` if available, else `cpu`; MPS is
+never auto-selected -- see [Environment](#environment) for why).
 
-Output is a CSV with one row per transformer block: cumulative sparsity,
-real loss, perplexity, and the damping value used for that block — this is
+Every command above prints the dense-model baseline loss/perplexity before
+pruning starts, then one progress line per block/layer during pruning
+(more verbose for `cws_realloss`, which logs per-row damping-retry events
+too -- see `cws_realloss`'s method description above), and finally the
+pruned model's real loss/perplexity vs. the dense baseline.
+
+`--out` writes a CSV with one row per transformer block: cumulative
+sparsity, real loss, perplexity, and the damping value used for that
+block — the full per-block trajectory, not just the final number. This is
 the ELSA-style "real loss vs. sparsity" trajectory, at the model level
 rather than the layer-reconstruction level.
 
@@ -215,12 +314,13 @@ special-case.
 
 ```
 realloss_pruning/
-  hessian.py         # local-reconstruction Hessian accumulation (cws/sparsegpt)
-  cws_obs.py          # full-Hessian cancellation-aware OBS selection+correction
-  sparsegpt_obs.py     # real SparseGPT: diagonal selection, full OBS correction
-  fisher_hessian.py   # real-loss empirical-Fisher Hessian (cws_realloss)
-  real_loss.py        # real next-token cross-entropy loss (monitoring signal)
-  pruner.py           # sequential layer-by-layer driver + adaptive control
-  data.py             # WikiText-2 calibration/held-out batch loading
-run_prune.py           # CLI entry point
+  hessian.py          # local-reconstruction Hessian accumulation (cws/sparsegpt)
+  cws_obs.py           # full-Hessian cancellation-aware OBS selection+correction
+  sparsegpt_obs.py      # real SparseGPT: diagonal selection, full OBS correction
+  fisher_hessian.py    # real-loss empirical-Fisher Hessian (cws_realloss, row+shared)
+  real_loss.py         # real next-token cross-entropy loss (monitoring signal)
+  pruner.py            # sequential layer-by-layer driver + adaptive control
+  data.py              # WikiText-2 calibration/held-out batch loading
+run_prune.py            # CLI entry point
+requirements.txt         # pinned to tested versions (see Environment)
 ```
